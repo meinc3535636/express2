@@ -18,7 +18,7 @@ async function dnsresolve(domain) {
 
 // --- CONFIGURATION ---
 const MAX_INTERNAL_PAGES = 4;
-const REQUEST_TIMEOUT = 10000;
+const REQUEST_TIMEOUT = 20000;
 const ALLOWED_TLDS = ['net','in','ru','blog','gov','org'];
 const PARENT_FOLDER_NAME = 'sites list';
 
@@ -141,7 +141,10 @@ async function deepCrawlDomain(baseUrl) {
 
         try {
             console.log(`  -> Scraping: ${currentUrl}`);
-            const response = await axios.get(currentUrl, { timeout: REQUEST_TIMEOUT });
+            const response = await axios.get(currentUrl, { timeout: REQUEST_TIMEOUT,
+                 headers: {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
+                    }, });
             const html = response.data;
             const $ = cheerio.load(html);
             const textContent = $('body').text().replace(/\s+/g, ' ');
@@ -197,6 +200,8 @@ async function deepCrawlDomain(baseUrl) {
             siteReport.pagesCrawled++;
 
         } catch (error) {
+            siteReport.error=true;
+            return { siteReport, [] }
             console.error(`  -> [Error] Failed on ${currentUrl}:`, error.message);
         }
     }
