@@ -6,9 +6,9 @@ const { google } = require('googleapis');
 const { Readable } = require('stream');
 const URL = require('url').URL;
 
+const DOMAIN_REGEX = /\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(com|io|co|ai|app|dev|computer|nl|de|eu|me)\b/gi;
 const app = express();
 app.use(express.json());
-
 
 async function dnsresolve(domain) {
     const resolver = new dns.Resolver();
@@ -18,25 +18,24 @@ async function dnsresolve(domain) {
 }
 
 // --- CONFIGURATION ---
+const MAX_INTERNAL_PAGES = 4;
 const REQUEST_TIMEOUT = 20000;
-const MAX_INTERNAL_PAGES = 10; // Slightly higher, but rarely hit due to strict filtering
-const ALLOWED_TLDS = ['com', 'net', 'io', 'co', 'biz', 'me', 'app'];
-const PARENT_FOLDER_NAME = 'Sites Auth Forms';
-
-// Keywords that indicate a page might contain an auth form
-const AUTH_URL_REGEX = /login|signin|sign-in|register|signup|sign-up|join|account|auth|portal/i;
+const ALLOWED_TLDS = ['net','in','ru','blog','gov','org'];
+const PARENT_FOLDER_NAME = 'sites list';
 
 // --- STATE MANAGEMENT ---
 const visitedDomains = new Set();
 const globalQueue = [];
 let isProcessingQueue = false;
-let driveFolderCache = {}; 
+let driveFolderCache = {}; // Caches folder IDs: { 'sites list': 'ID', 'saas': 'ID', ... }
 
 // --- DRIVE API HELPERS ---
 async function getOrCreateFolder(drive, folderName, parentId = null) {
+    // Return from cache if we already found/created it
     const cacheKey = parentId ? `${parentId}_${folderName}` : folderName;
     if (driveFolderCache[cacheKey]) return driveFolderCache[cacheKey];
 
+    // Check if folder exists
     let query = `mimeType='application/vnd.google-apps.folder' and name='${folderName}' and trashed=false`;
     if (parentId) query += ` and '${parentId}' in parents`;
 
@@ -48,6 +47,7 @@ async function getOrCreateFolder(drive, folderName, parentId = null) {
         return folderId;
     }
 
+    // Create if it doesn't exist
     const fileMetadata = {
         name: folderName,
         mimeType: 'application/vnd.google-apps.folder',
@@ -66,65 +66,73 @@ async function uploadToDrive(accessToken, siteName, category, jsonData) {
     const drive = google.drive({ version: 'v3', auth });
 
     try {
+        // 1. Get/Create "sites list" parent folder
         const parentFolderId = await getOrCreateFolder(drive, PARENT_FOLDER_NAME);
+        
+        // 2. Get/Create category sub-folder inside "sites list"
         const categoryFolderId = await getOrCreateFolder(drive, category, parentFolderId);
 
-        const fileMetadata = { name: `${siteName}.json`, parents: [categoryFolderId] };
+        // 3. Upload JSON
+        const fileMetadata = {
+            name: `${siteName}.json`,
+            parents: [categoryFolderId]
+        };
         const media = {
             mimeType: 'application/json',
             body: Readable.from([JSON.stringify(jsonData, null, 2)])
         };
 
         await drive.files.create({ resource: fileMetadata, media: media, fields: 'id' });
-        console.log(`[Drive] Uploaded ${siteName}.json to '${category}'`);
+        console.log(`[Drive] Uploaded ${siteName}.json to '${PARENT_FOLDER_NAME}/${category}'`);
     } catch (error) {
         console.error(`[Drive] Failed to upload ${siteName}:`, error.message);
     }
 }
 
-// --- UTILS & FORM CLASSIFICATION ---
+// --- UTILS ---
 function getRootDomain(hostname) {
     const parts = hostname.replace('www.', '').split('.');
     return parts.length >= 2 ? parts.slice(-2).join('.') : hostname;
 }
 
-function classifySite(report) {
-    const hasLogin = report.loginForms.length > 0;
-    const hasRegister = report.registerForms.length > 0;
-    
-    if (hasLogin && hasRegister) return 'both';
-    if (hasLogin) return 'login';
-    if (hasRegister) return 'register';
-    return 'none';
-}
+function categorizeSite(text) {
+    const t = text.toLowerCase();
+    const scores = { saas: 0, social: 0, ecommerce: 0 };
+    const keywords = {
+        saas: ['pricing', 'signup', 'dashboard', 'subscription', 'api']
+    };
 
-function isAuthForm($, form) {
-    const action = ($(form).attr('action') || '').toLowerCase();
-    const hasPassword = $(form).find('input[type="password"]').length > 0;
-    const hasAuthKeywords = /login|signin|register|signup|auth/i.test(action);
-    return hasPassword || hasAuthKeywords;
-}
+    for (const [category, words] of Object.entries(keywords)) {
+        for (const word of words) {
+            const matches = t.match(new RegExp(`\\b${word}\\b`, 'g'));
+            if (matches) scores[category] += matches.length;
+        }
+    }
 
-function categorizeForm($, form) {
-    const action = ($(form).attr('action') || '').toLowerCase();
-    const text = $(form).text().toLowerCase();
-    if (/register|signup|sign-up|create account/i.test(`${text} ${action}`)) return 'registerForms';
-    return 'loginForms';
+    let bestCategory = 'general';
+    let highest = 2; // threshold
+    for (const [cat, score] of Object.entries(scores)) {
+        if (score > highest) { highest = score; bestCategory = cat; }
+    }
+    return bestCategory;
 }
 
 // --- CORE CRAWLER LOGIC ---
-async function targetedAuthCrawl(baseUrl) {
+async function deepCrawlDomain(baseUrl) {
     const rootDomain = getRootDomain(new URL(baseUrl).hostname);
-    const internalQueue = [baseUrl]; // Always start with homepage
+    const internalQueue = [baseUrl];
     const visitedInternal = new Set();
     
     const siteReport = {
         domain: rootDomain,
-        category: 'none',
+        category: 'general',
+        description: '',
         pagesCrawled: 0,
-        loginForms: [],
-        registerForms: [],
-        outboundDomains: new Set()
+        outboundDomains: new Set(),
+        internalLinks: new Set(),
+        forms: [],
+        pages: [],
+        aggregateText: ""
     };
 
     while (internalQueue.length > 0 && siteReport.pagesCrawled < MAX_INTERNAL_PAGES) {
@@ -133,73 +141,85 @@ async function targetedAuthCrawl(baseUrl) {
         visitedInternal.add(currentUrl);
 
         try {
-            console.log(`  -> [Targeted] Scraping: ${currentUrl}`);
-            const response = await axios.get(currentUrl, { 
-                timeout: REQUEST_TIMEOUT,
-                headers: { 'User-Agent': 'GoogleBot' }
-            });
-            const $ = cheerio.load(response.data);
-            siteReport.pagesCrawled++;
+            console.log(`  -> Scraping: ${currentUrl}`);
+            const response = await axios.get(currentUrl, { timeout: REQUEST_TIMEOUT,
+                 headers: {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
+                    }, });
+            const html = response.data;
+            const matches = html.match(DOMAIN_REGEX) || [];
+            siteReport.outboundDomains = siteReport.outboundDomains.union( new Set(matches.map(d => d.toLowerCase())) );
+            const $ = cheerio.load(html);
+            const textContent = $('body').text().replace(/\s+/g, ' ');
 
-            // Extract Auth Forms
-            $('form').each((_, form) => {
-                if (isAuthForm($, form)) {
-                    const formDetails = {
-                        url: currentUrl,
-                        action: $(form).attr('action') || null,
-                        method: ($(form).attr('method') || 'GET').toUpperCase(),
-                        inputs: []
-                    };
+            // Set main description if this is the homepage
+            if (siteReport.pagesCrawled === 0) {
+                siteReport.description = $('meta[name="description"]').attr('content') || $('meta[property="og:description"]').attr('content') || '';
+            }
 
-                    $(form).find('input, select').each((_, input) => {
-                        formDetails.inputs.push({
-                            type: $(input).attr('type') || null,
-                            name: $(input).attr('name') || 'unnamed'
-                        });
+            // Extract Forms
+            $('form').each((_, el) => {
+                const action = $(el).attr('action') || 'unknown';
+                const method = $(el).attr('method') || 'GET';
+                const inputs = [];
+                
+                $(el).find('input, select, textarea').each((_, input) => {
+                    inputs.push({
+                        type: $(input).attr('type') || el.tagName.toLowerCase(),
+                        name: $(input).attr('name') || 'unnamed'
                     });
+                });
 
-                    const type = categorizeForm($, form);
-                    siteReport[type].push(formDetails);
-                }
+                siteReport.forms.push({ page: currentUrl, action, method, inputs });
             });
-
+            
             // Extract Links
             $('a').each((_, el) => {
                 const href = $(el).attr('href');
-                if (!href || href.startsWith('javascript:')) return;
+                if (!href || href.startsWith('javascript:') || href.startsWith('mailto:')) return;
+
+                // Avoid blogs and news
+                if (href.toLowerCase().includes('blog') || href.toLowerCase().includes('news') || href.toLowerCase().includes('article')) return;
 
                 try {
-                    const parsedUrl = new URL(href, baseUrl);
-                    const hrefRoot = getRootDomain(parsedUrl.hostname);
+                    const parsedHref = new URL(href, baseUrl);
+                    const hrefRoot = getRootDomain(parsedHref.hostname);
 
                     if (hrefRoot === rootDomain) {
-                        // SMART FILTER: Only queue internal links if they look like Auth/Account pages
-                        if (AUTH_URL_REGEX.test(parsedUrl.pathname) && !visitedInternal.has(parsedUrl.href)) {
-                            internalQueue.push(parsedUrl.href);
-                        }
+                        siteReport.internalLinks.add(parsedHref.href);
+                        if (!visitedInternal.has(parsedHref.href)) internalQueue.push(parsedHref.href);
                     } else {
-                        // Keep track of external domains to feed the master queue
                         const tld = hrefRoot.split('.').pop().toLowerCase();
-                        if (ALLOWED_TLDS.includes(tld)) {
-                            siteReport.outboundDomains.add(hrefRoot);
-                        }
+                        if (!ALLOWED_TLDS.includes(tld)) siteReport.outboundDomains.add(hrefRoot);
                     }
-                } catch (e) {}
+                } catch (e) {} // ignore malformed urls
             });
 
+            siteReport.pages.push({
+                url: currentUrl,
+                title: $('title').text().trim()
+            });
+            siteReport.aggregateText += textContent + " ";
+            siteReport.pagesCrawled++;
+
         } catch (error) {
-            // Ignore 404s, timeouts, etc.
+            siteReport.error=true;
+            return { siteReport, nextTargets:[] }
+            console.error(`  -> [Error] Failed on ${currentUrl}:`, error.message);
         }
     }
 
-    siteReport.category = classifySite(siteReport);
+    siteReport.category = categorizeSite(siteReport.aggregateText);
+    delete siteReport.aggregateText; 
+    
     const nextTargets = Array.from(siteReport.outboundDomains);
     siteReport.outboundDomains = nextTargets;
+    siteReport.internalLinks = Array.from(siteReport.internalLinks);
 
     return { siteReport, nextTargets };
 }
 
-// --- QUEUE PROCESSOR & PARALLEL DNS ---
+// --- QUEUE PROCESSOR (One at a time) ---
 async function processQueue(accessToken) {
     if (isProcessingQueue) return;
     isProcessingQueue = true;
@@ -211,13 +231,14 @@ async function processQueue(accessToken) {
         if (visitedDomains.has(rootDomain)) continue;
         visitedDomains.add(rootDomain);
 
-        console.log(`\n[Queue] Starting site: ${rootDomain} | Remaining: ${globalQueue.length}`);
+        console.log(`\n[Processing Queue] Starting site: ${rootDomain}`);
+        console.log(`[Queue Status] Remaining sites: ${globalQueue.length}`);
 
         try {
-            const { siteReport, nextTargets } = await targetedAuthCrawl(nextUrl);
-            
-            // Upload to Google Drive
+            const { siteReport, nextTargets } = await deepCrawlDomain(nextUrl);
             await uploadToDrive(accessToken, rootDomain, siteReport.category, siteReport);
+
+            // Verify DNS and add outbound domains to queue
             for (const domain of nextTargets) {
                 if (!visitedDomains.has(domain)) {
                     try {
@@ -226,14 +247,13 @@ async function processQueue(accessToken) {
                     } catch (e) { /* DNS Failed, ignore */ }
                 }
             }
-
         } catch (error) {
             console.error(`[Queue Error] on ${nextUrl}:`, error.message);
         }
     }
 
     isProcessingQueue = false;
-    console.log('[Queue] Empty. Waiting for new URLs.');
+    console.log('[Queue] All done! Waiting for new URLs.');
 }
 
 // --- EXPRESS ENDPOINT ---
@@ -245,12 +265,17 @@ app.post('/api/start-crawler', (req, res) => {
     }
 
     startUrls.forEach(url => globalQueue.push(url));
+    
+    // Start processing asynchronously in the background
     processQueue(accessToken).catch(console.error);
 
     res.status(202).json({ 
-        message: 'Auth Form Crawler running.',
+        message: 'URLs added to global queue. Crawler is running sequentially.',
         queueSize: globalQueue.length 
     });
 });
 
-app.listen(3000, () => console.log('Auth Crawler running on http://localhost:3000'));
+app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+
+app.listen(3000, () => console.log('Server running on http://localhost:3000'));
+
