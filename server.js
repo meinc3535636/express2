@@ -201,7 +201,7 @@ async function deepCrawlDomain(baseUrl) {
 
         } catch (error) {
             siteReport.error=true;
-            return { siteReport, [] }
+            return { siteReport, nextTargets:[] }
             console.error(`  -> [Error] Failed on ${currentUrl}:`, error.message);
         }
     }
